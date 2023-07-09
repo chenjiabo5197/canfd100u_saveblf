@@ -3,20 +3,13 @@
 #### 介绍
 读取zlg canfd100u的发送的can和canfd信号，并保存成blf文件
 
-#### 软件架构
-
-
-#### 安装教程
-
-1.  xxxx
-2.  xxxx
-3.  xxxx
 
 #### 使用说明
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+1.  使用make命令编译，然后执行编译生成的文件即可读取can1接口的信号，并将can信号保存为can.blf文件，canfd信号保存为 canfd.blf文件
+
+Q&A
+如果出现无libbinlog.so,将代码下的libbinlog.so复制到编译器寻找so的路径下即可
 
 #### 参与贡献
 
