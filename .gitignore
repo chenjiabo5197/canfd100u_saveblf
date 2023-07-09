@@ -6,6 +6,8 @@
 *.dylib
 *.idea/*
 *.idea
+cmake-build-debug
+cmake-build-debug/*
 
 # Test binary, built with `go test -c`
 *.test
