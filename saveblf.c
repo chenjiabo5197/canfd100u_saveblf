@@ -1,11 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <pthread.h>
 #include "zcan.h"
 #include "binlog.h"
@@ -24,6 +21,9 @@ unsigned gDevType = 42;  // 33
 unsigned gDevIdx = 0;
 unsigned gChMask = 0;
 unsigned gTxType = 0;
+unsigned gTxSleep = 0;
+unsigned gTxFrames = 0;
+unsigned gTxCount = 0;
 
 unsigned s2n(const char *s)
 {
@@ -286,7 +286,7 @@ void* rx_thread_canfd(void *data)
 
     while (!ctx->stop && !ctx->error)
     {
-        cnt = VCI_Receive(gDevType, gDevIdx, ctx->channel, buff, RX_BUFF_SIZE, RX_WAIT_TIME);
+        cnt = VCI_ReceiveFD(gDevType, gDevIdx, ctx->channel, buff, RX_BUFF_SIZE, RX_WAIT_TIME);
         if (!cnt)
             continue;
 
@@ -469,14 +469,14 @@ int main(int argc, char* argv[])
     printf("VCI_StartCAN succeeded\n");
 
 
-    ZCAN_FD_MSG can;
-    time_t tm1, tm2;
-    for (i = 0; i < 3; i++) {
-        time(&tm1);
-        VCI_ReceiveFD(gDevType, gDevIdx, 0, &can, 1, (i + 1) * 1000/*ms*/);
-        time(&tm2);
-        printf("VCI_Receive returned: time ~= %ld seconds\n", tm2 - tm1);
-    }
+//    ZCAN_FD_MSG can;
+//    time_t tm1, tm2;
+//    for (i = 0; i < 3; i++) {
+//        time(&tm1);
+//        VCI_ReceiveFD(gDevType, gDevIdx, 0, &can, 1, (i + 1) * 1000/*ms*/);
+//        time(&tm2);
+//        printf("VCI_Receive returned: time ~= %ld seconds\n", tm2 - tm1);
+//    }
 
     // ----- create RX-threads --------------------------------------------
 
@@ -496,11 +496,12 @@ int main(int argc, char* argv[])
 
     // ----- stop RX -------------------------------------------------
     // 设置终止条件
-    for (int i = 0; i < 1000; ++i) {
+    int i;
+    for (i = 0; i < 1000; ++i) {
         sleep(1);
     }
     // 关闭线程
-    for (int i = 0; i < 2; ++i) {
+    for (i = 0; i < 2; ++i) {
         printf("kill receive thread\n");
         rx_ctx[i].stop = 1;
         pthread_join(rx_threads[i], NULL);
