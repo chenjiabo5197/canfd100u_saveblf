@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include "zcan.h"
+#include "binlog.h"
 
 #define msleep(ms)  usleep((ms)*1000)
 #define min(a,b)  (((a) < (b)) ? (a) : (b))
@@ -19,13 +20,10 @@
 #define RX_WAIT_TIME  100
 #define RX_BUFF_SIZE  1000
 
-unsigned gDevType = 0;
+unsigned gDevType = 42;  // 33
 unsigned gDevIdx = 0;
 unsigned gChMask = 0;
 unsigned gTxType = 0;
-unsigned gTxSleep = 0;
-unsigned gTxFrames = 0;
-unsigned gTxCount = 0;
 
 unsigned s2n(const char *s)
 {
@@ -125,34 +123,107 @@ typedef struct {
     unsigned error; // error(s) detected
 } THREAD_CTX;
 
-void* rx_thread(void *data)
+SYSTEMTIME ToUtcTime(struct  timespec *time){
+    struct tm t;
+    gmtime_r(&time->tv_sec, &t);
+    SYSTEMTIME st;
+    st.wYear = (uint16_t)(t.tm_year + 1900);
+    st.wMonth = (uint16_t)(t.tm_mon + 1);
+    st.wDayOfWeek = (uint16_t)t.tm_wday;
+    st.wDay = (uint16_t)t.tm_mday;
+    st.wHour = (uint16_t)t.tm_hour;
+    st.wMinute = (uint16_t)t.tm_min;
+    st.wSecond = (uint16_t)t.tm_sec;
+    st.wMilliseconds = (uint16_t)(time->tv_nsec / 1000000);
+    return st;
+}
+
+SYSTEMTIME GetUtcTime(){
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ToUtcTime(&ts);
+}
+
+void* rx_thread_can(void *data)
 {
+    const char *pFileName = "can.blf";
+    BLHANDLE hFile;
+    SYSTEMTIME systemtime;
+
+    VBLAppTrigger  appTrigger;
+    VBLCANMessage message;
+
+    uint64_t time;
+
+    // open file
+    hFile = BLCreateFile(pFileName, GENERIC_WRITE);
+    if (BLINVALID_HANDLE_VALUE == hFile) {
+        printf("open can blf file fail");
+        return NULL;
+    }
+    // 指定写入文件的应用程序
+    BLSetApplication(hFile, BL_APPID_CANCASEXLLOG,1,0,1);
+
+    systemtime = GetUtcTime();
+    // 设定blf文件的写入时间
+    BLSetMeasurementStartTime(hFile, &systemtime);
+    // 设置压缩级别
+    BLSetWriteOptions(hFile, 6, 0);
+
     THREAD_CTX *ctx = (THREAD_CTX *)data;
     ctx->total = 0; // reset counter
-
-#if CANFD_TEST
-    ZCAN_FD_MSG buff[RX_BUFF_SIZE]; // buffer
-#else
     ZCAN_20_MSG buff[RX_BUFF_SIZE]; // buffer
-#endif
     int cnt; // current received
     int i;
 
     unsigned check_point = 0;
+
     while (!ctx->stop && !ctx->error)
     {
-#if CANFD_TEST
-        cnt = VCI_ReceiveFD(gDevType, gDevIdx, ctx->channel, buff, RX_BUFF_SIZE, RX_WAIT_TIME);
-#else
         cnt = VCI_Receive(gDevType, gDevIdx, ctx->channel, buff, RX_BUFF_SIZE, RX_WAIT_TIME);
-#endif
         if (!cnt)
             continue;
 
         for (i = 0; i < cnt; i++) {
-            int ret = verify_frame(&buff[i]);
-            if (ret > 0) continue;
-            printf("CAN%d: RX: verify_frame() failed: ret=%d\n", ctx->channel, ret);
+            // initialize all numbers to zero
+            memset(&appTrigger, 0, sizeof(VBLAppTrigger));
+            memset(&message, 0, sizeof(VBLCANMessage));
+
+            // setup object headers
+            appTrigger.mHeader.mBase.mSignature = BL_OBJ_SIGNATURE;
+            appTrigger.mHeader.mBase.mHeaderSize = sizeof(appTrigger.mHeader);
+            appTrigger.mHeader.mBase.mHeaderVersion = 1;
+            appTrigger.mHeader.mBase.mObjectSize = sizeof(VBLAppTrigger);
+            appTrigger.mHeader.mBase.mObjectType = BL_OBJ_TYPE_APP_TRIGGER;
+            appTrigger.mHeader.mObjectFlags = BL_OBJ_FLAG_TIME_ONE_NANS;
+
+            message.mHeader.mBase.mSignature = BL_OBJ_SIGNATURE;
+            message.mHeader.mBase.mHeaderSize = sizeof(message.mHeader);;
+            message.mHeader.mBase.mHeaderVersion = 1;
+            message.mHeader.mBase.mObjectSize = sizeof(VBLCANMessage);;
+            message.mHeader.mBase.mObjectType = BL_OBJ_TYPE_CAN_MESSAGE;
+            message.mHeader.mObjectFlags = BL_OBJ_FLAG_TIME_ONE_NANS;
+
+            time = buff[i].hdr.ts;
+            // usbcanfd-100u时间戳为百微妙级别，但是blf文件接收纳秒，所以*100000
+            // 此处必须先转化为uint64位，再进行乘法，否则会溢出，表现为写入文件的数据前后时间错乱
+            time *= 100000;
+
+            //设置头文件
+            appTrigger.mHeader.mObjectTimeStamp = time;
+            BLWriteObject(hFile, &appTrigger.mHeader.mBase);
+            message.mHeader.mObjectTimeStamp = time;
+
+            // 设置CAN数据
+            message.mChannel = 1;  // zlg从can1开始，此处只连接了can1
+            message.mFlags = CAN_MSG_FLAGS(0, buff[i].hdr.inf.sdf);
+            message.mDLC = buff[i].hdr.len;
+            message.mID = buff[i].hdr.id;
+            memcpy(message.mData, buff[i].dat, message.mDLC);
+
+            BLWriteObject(hFile, &message.mHeader.mBase);
+
+            printf("id=%x, timestamp=%u", buff[i].hdr.id, buff[i].hdr.ts);
             ctx->error = 1;
             break;
         }
@@ -167,6 +238,121 @@ void* rx_thread(void *data)
 
     printf("CAN%d: RX: rx-thread terminated, %d frames received & verified: %s\n",
         ctx->channel, ctx->total, ctx->error ? "error(s) detected" : "no error");
+
+    // 关闭blf文件
+    if(!BLCloseHandle(hFile)){
+        printf("close file fail");
+        return NULL;
+    }
+
+    pthread_exit(0);
+    return NULL;
+}
+
+void* rx_thread_canfd(void *data)
+{
+    const char *pFileName = "canfd.blf";
+    BLHANDLE hFile;
+    SYSTEMTIME systemtime;
+
+    VBLAppTrigger  appTrigger;
+    VBLCANFDMessage64 fdmessage;
+
+    uint64_t time;
+
+    // open file
+    hFile = BLCreateFile(pFileName, GENERIC_WRITE);
+    if (BLINVALID_HANDLE_VALUE == hFile) {
+        printf("open can blf file fail");
+        return NULL;
+    }
+    // 指定写入文件的应用程序
+    BLSetApplication(hFile, BL_APPID_CANCASEXLLOG,1,0,1);
+
+    systemtime = GetUtcTime();
+    // 设定blf文件的写入时间
+    BLSetMeasurementStartTime(hFile, &systemtime);
+
+    // 设置压缩级别
+    BLSetWriteOptions(hFile, 6, 0);
+
+    THREAD_CTX *ctx = (THREAD_CTX *)data;
+    ctx->total = 0; // reset counter
+    ZCAN_FD_MSG buff[RX_BUFF_SIZE]; // buffer
+    int cnt; // current received
+    int i;
+
+    unsigned check_point = 0;
+
+    while (!ctx->stop && !ctx->error)
+    {
+        cnt = VCI_Receive(gDevType, gDevIdx, ctx->channel, buff, RX_BUFF_SIZE, RX_WAIT_TIME);
+        if (!cnt)
+            continue;
+
+        for (i = 0; i < cnt; i++) {
+            // initialize all numbers to zero
+            memset(&appTrigger, 0, sizeof(VBLAppTrigger));
+            memset(&fdmessage, 0, sizeof(VBLCANFDMessage64));
+
+            // setup object headers
+            appTrigger.mHeader.mBase.mSignature = BL_OBJ_SIGNATURE;
+            appTrigger.mHeader.mBase.mHeaderSize = sizeof(appTrigger.mHeader);
+            appTrigger.mHeader.mBase.mHeaderVersion = 1;
+            appTrigger.mHeader.mBase.mObjectSize = sizeof(VBLAppTrigger);
+            appTrigger.mHeader.mBase.mObjectType = BL_OBJ_TYPE_APP_TRIGGER;
+            appTrigger.mHeader.mObjectFlags = BL_OBJ_FLAG_TIME_ONE_NANS;
+
+            fdmessage.mHeader.mBase.mSignature = BL_OBJ_SIGNATURE;
+            fdmessage.mHeader.mBase.mHeaderSize = sizeof(fdmessage.mHeader);;
+            fdmessage.mHeader.mBase.mHeaderVersion = 1;
+            fdmessage.mHeader.mBase.mObjectSize = sizeof(VBLCANFDMessage64);;
+            fdmessage.mHeader.mBase.mObjectType = BL_OBJ_TYPE_CAN_FD_MESSAGE_64;
+            fdmessage.mHeader.mObjectFlags = BL_OBJ_FLAG_TIME_ONE_NANS;
+
+            time = buff[i].hdr.ts;
+            // usbcanfd-100u时间戳为百微妙级别，但是blf文件接收纳秒，所以*100000
+            // 此处必须先转化为uint64位，再进行乘法，否则会溢出，表现为写入文件的数据前后时间错乱
+            time *= 100000;
+
+            //设置头文件
+            appTrigger.mHeader.mObjectTimeStamp = time;
+            BLWriteObject(hFile, &appTrigger.mHeader.mBase);
+            fdmessage.mHeader.mObjectTimeStamp = time;
+
+            // 设置CAN数据
+            fdmessage.mChannel = 1;  // zlg从can1开始，此处只连接了can1
+            fdmessage.mFlags = CAN_FD_MSG_FLAGS(buff[i].hdr.inf.fmt, buff[i].hdr.inf.brs,buff[i].hdr.inf.est);
+            fdmessage.mDLC = len_to_dlc(buff[i].hdr.len);
+            fdmessage.mID = buff[i].hdr.id;
+            fdmessage.mDir = buff[i].hdr.inf.txm;
+            fdmessage.mValidDataBytes = buff[i].hdr.len;
+            fdmessage.mExtDataOffset = 0;
+            memcpy(fdmessage.mData, buff[i].dat, fdmessage.mDLC);
+
+            BLWriteObject(hFile, &fdmessage.mHeader.mBase);
+
+            printf("id=%x, timestamp=%u", buff[i].hdr.id, buff[i].hdr.ts);
+            ctx->error = 1;
+            break;
+        }
+        if (ctx->error) break;
+
+        ctx->total += cnt;
+        if (ctx->total / CHECK_POINT >= check_point) {
+            printf("CAN%d: RX: %d frames received & verified\n", ctx->channel, ctx->total);
+            check_point++;
+        }
+    }
+
+    printf("CAN%d: RX: rx-thread terminated, %d frames received & verified: %s\n",
+           ctx->channel, ctx->total, ctx->error ? "error(s) detected" : "no error");
+
+    // 关闭blf文件
+    if(!BLCloseHandle(hFile)){
+        printf("close file fail");
+        return NULL;
+    }
 
     pthread_exit(0);
     return NULL;
@@ -229,8 +415,15 @@ void* tx_thread(void *data)
     return NULL;
 }
 
-int test()
+
+int main(int argc, char* argv[])
 {
+    if(!VCI_OpenDevice(gDevType, gDevIdx, 0)){
+        printf("VCI_OpenDevice failed\n");
+        return 0;
+    }
+    printf("VCI_OpenDevice succeeded\n");
+
     // ----- device info --------------------------------------------------
 
     ZCAN_DEV_INF info;
@@ -243,164 +436,75 @@ int test()
     sn[20] = '\0';
     id[40] = '\0';
     printf("HWV=0x%04x, FWV=0x%04x, DRV=0x%04x, API=0x%04x, IRQ=0x%04x, CHN=0x%02x, SN=%s, ID=%s\n",
-        info.hwv, info.fwv, info.drv, info.api, info.irq, info.chn, sn, id);
+           info.hwv, info.fwv, info.drv, info.api, info.irq, info.chn, sn, id);
 
     // ----- init & start -------------------------------------------------
 
     ZCAN_INIT init;
     init.clk = 60000000; // clock: 60M
     init.mode = 0;
-#if CANFD_TEST
     init.aset.tseg1 = 46; // 1M
     init.aset.tseg2 = 11;
     init.aset.sjw = 3;
     init.aset.smp = 0;
-    init.aset.brp = 0;
+    init.aset.brp = 1;
     init.dset.tseg1 = 10; // 4M
     init.dset.tseg2 = 2;
     init.dset.sjw = 2;
     init.dset.smp = 0;
-    init.dset.brp = 0;
-#else
-    init.aset.tseg1 = 46; // 1M
-    init.aset.tseg2 = 11;
-    init.aset.sjw = 3;
-    init.aset.smp = 0;
-    init.aset.brp = 2;
-    init.dset.tseg1 = 14; // 1M
-    init.dset.tseg2 = 3;
-    init.dset.sjw = 3;
-    init.dset.smp = 0;
-    init.dset.brp = 0;
-#endif
+    init.dset.brp = 1;
 
-    int i;
-    for (i = 0; i < MAX_CHANNELS; i++) {
-        if ((gChMask & (1 << i)) == 0) continue;
 
-        if (!VCI_InitCAN(gDevType, gDevIdx, i, &init)) {
-            printf("VCI_InitCAN(%d) failed\n", i);
-            return 0;
-        }
-        printf("VCI_InitCAN(%d) succeeded\n", i);
-
-        if (!VCI_StartCAN(gDevType, gDevIdx, i)) {
-            printf("VCI_StartCAN(%d) failed\n", i);
-            return 0;
-        }
-        printf("VCI_StartCAN(%d) succeeded\n", i);
+    // 只读取can0的信号，所以之初始化can0
+    if (!VCI_InitCAN(gDevType, gDevIdx, 0, &init)) {
+        printf("VCI_InitCAN failed\n");
+        return 0;
     }
+    printf("VCI_InitCAN succeeded\n");
 
-    // ----- RX-timeout test ----------------------------------------------
+    if (!VCI_StartCAN(gDevType, gDevIdx, 0)) {
+        printf("VCI_StartCAN failed\n");
+        return 0;
+    }
+    printf("VCI_StartCAN succeeded\n");
+
 
     ZCAN_FD_MSG can;
     time_t tm1, tm2;
-#if 0
     for (i = 0; i < 3; i++) {
         time(&tm1);
         VCI_ReceiveFD(gDevType, gDevIdx, 0, &can, 1, (i + 1) * 1000/*ms*/);
         time(&tm2);
         printf("VCI_Receive returned: time ~= %ld seconds\n", tm2 - tm1);
     }
-#endif
 
     // ----- create RX-threads --------------------------------------------
 
-    THREAD_CTX rx_ctx[MAX_CHANNELS];
-    pthread_t rx_threads[MAX_CHANNELS];
-    for (i = 0; i < MAX_CHANNELS; i++) {
-        if ((gChMask & (1 << i)) == 0) continue;
+    THREAD_CTX rx_ctx[2];  // can和canfd两个线程接受信号
+    pthread_t rx_threads[2];
+    rx_ctx[0].channel = 0;
+    rx_ctx[0].stop = 0;
+    rx_ctx[0].total = 0;
+    rx_ctx[0].error = 0;
+    pthread_create(&rx_threads[0], NULL, rx_thread_can, &rx_ctx[0]);
+    rx_ctx[1].channel = 0;
+    rx_ctx[1].stop = 0;
+    rx_ctx[1].total = 0;
+    rx_ctx[1].error = 0;
+    pthread_create(&rx_threads[1], NULL, rx_thread_canfd, &rx_ctx[1]);
 
-        rx_ctx[i].channel = i;
-        rx_ctx[i].stop = 0;
-        rx_ctx[i].total = 0;
-        rx_ctx[i].error = 0;
-        pthread_create(&rx_threads[i], NULL, rx_thread, &rx_ctx[i]);
+
+    // ----- stop RX -------------------------------------------------
+    // 设置终止条件
+    for (int i = 0; i < 1000; ++i) {
+        sleep(1);
     }
-
-    // ----- wait --------------------------------------------------------
-
-    printf("<ENTER> to start TX: %d*%d frames/channel ...\n",
-        gTxFrames, gTxCount);
-    getchar();
-
-    // ----- start transmit -----------------------------------------------
-
-    THREAD_CTX tx_ctx[MAX_CHANNELS];
-    pthread_t tx_threads[MAX_CHANNELS];
-    for (i = 0; i < MAX_CHANNELS; i++) {
-        if ((gChMask & (1 << i)) == 0) continue;
-
-        tx_ctx[i].channel = i;
-        tx_ctx[i].stop = 0;
-        tx_ctx[i].total = 0;
-        tx_ctx[i].error = 0;
-        pthread_create(&tx_threads[i], NULL, tx_thread, &tx_ctx[i]);
-    }
-
-    // ----- stop TX & RX -------------------------------------------------
-
-    int err = 0;
-    for (i = 0; i < MAX_CHANNELS; i++) {
-        if ((gChMask & (1 << i)) == 0) continue;
-        pthread_join(tx_threads[i], NULL);
-        if (tx_ctx[i].error)
-            err = 1;
-    }
-    sleep(2);
-    for (i = 0; i < MAX_CHANNELS; i++) {
-        if ((gChMask & (1 << i)) == 0) continue;
+    // 关闭线程
+    for (int i = 0; i < 2; ++i) {
+        printf("kill receive thread\n");
         rx_ctx[i].stop = 1;
         pthread_join(rx_threads[i], NULL);
-        if (rx_ctx[i].error)
-            err = 1;
     }
-
-    // ----- report -------------------------------------------------------
-
-    printf(err ? "error(s) detected, test failed\n" : "test succeeded\n");
-    return !err;
-}
-
-int main(int argc, char* argv[])
-{
-    if (argc < 8) {
-        printf("test [DevType] [DevIdx] [ChMask] [TxType] [TxSleep] [TxFrames] [TxCount]\n"
-            "    example: test 33 0 3 2 3 10 1000\n"
-            "                  |  | | | | |  | 1000 times\n"
-            "                  |  | | | | |\n"
-            "                  |  | | | | |10 frames once\n"
-            "                  |  | | | |\n"
-            "                  |  | | | |tx > sleep(3ms) > tx > sleep(3ms) ....\n"
-            "                  |  | | |\n"
-            "                  |  | | |0-normal, 1-single, 2-self_test, 3-single_self_test, 4-single_no_wait....\n"
-            "                  |  | |\n"
-            "                  |  | |bit0-CAN1, bit1-CAN2, bit2-CAN3, bit3-CAN4, 3=CAN1+CAN2, 7=CAN1+CAN2+CAN3\n"
-            "                  |  |\n"
-            "                  |  |Card0\n"
-            "                  |\n"
-            "                  |4-usbcan-ii, 5-pci9820, 14-pci9840, 16-pci9820i, 33-usbcanfd....\n"
-            );
-        return 0;
-    }
-
-    gDevType = s2n(argv[1]);
-    gDevIdx = s2n(argv[2]);
-    gChMask = s2n(argv[3]);
-    gTxType = s2n(argv[4]);
-    gTxSleep = s2n(argv[5]);
-    gTxFrames = s2n(argv[6]);
-    gTxCount = s2n(argv[7]);
-    printf("DevType=%d, DevIdx=%d, ChMask=0x%x, TxType=%d, TxSleep=%d, TxFrames=0x%08x(%d), TxCount=0x%08x(%d)\n",
-        gDevType, gDevIdx, gChMask, gTxType, gTxSleep, gTxFrames, gTxFrames, gTxCount, gTxCount);
-
-    if (!VCI_OpenDevice(gDevType, gDevIdx, 0)) {
-        printf("VCI_OpenDevice failed\n");
-        return 0;
-    }
-    printf("VCI_OpenDevice succeeded\n");
-
-    test();
 
     VCI_CloseDevice(gDevType, gDevIdx);
     printf("VCI_CloseDevice\n");

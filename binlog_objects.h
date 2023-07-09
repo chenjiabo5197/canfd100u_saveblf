@@ -315,6 +315,12 @@ typedef struct VBLCANMessage_t
   uint8_t         mData[8];                    /* CAN data */
 } VBLCANMessage;
 
+/*
+ * dir: Direction of CAN frame  0 rt 1tx
+ * rtr: Remote Transmission Request  0 no rtr 1 rtr
+ * nerr: Single wire operation  0 no nerr 1 nerr
+ * wu: Wake up Message  0 no wu 1 wu
+ */
 // CAN dir, rtr, wu & nerr encoded into flags
 #define CAN_MSG_DIR( f)          ( uint8_t)(   f & 0x0F)
 #define CAN_MSG_RTR( f)          ( uint8_t)( ( f & 0x80) >> 7)
@@ -331,7 +337,11 @@ typedef struct VBLCANMessage_t
 #define CAN_FD_MSG_BRS( f)      (uint8_t) ((f & 0x2) >> 1)
 #define CAN_FD_MSG_ESI( f)      (uint8_t) ((f & 0x4) >> 2)
 
-
+/*
+ * EDL(Extended Data Length) 主要用于区分标准CAN帧格式和CAN-FD的帧格式
+ * BRS(Bit Rate Switch) 位速率转换开关
+ * ESI(Error State Indicator) 错误状态指示，主动错误时发送显性位，被动错误时发送隐性位。
+ */
 #define  CAN_FD_MSG_FLAGS( edl, brs, esi) \
   ( uint8_t)( ( ( uint8_t)( edl  & 0x01)) | \
   ( ( uint8_t)( brs & 0x01) << 1) | \
