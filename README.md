@@ -5,11 +5,9 @@
 
 
 #### 使用说明
+ 1、 使用make命令编译，然后执行编译生成的文件即可读取can1接口的信号，并将can信号保存为can.blf文件，canfd信号保存为 canfd.blf文件
 
-1.  使用make命令编译，然后执行编译生成的文件即可读取can1接口的信号，并将can信号保存为can.blf文件，canfd信号保存为 canfd.blf文件
-
-Q&A
-如果出现无libbinlog.so,将代码下的libbinlog.so复制到编译器寻找so的路径下即可
+ 2、编译时出现无libusbcanfd.so或libbinlog.so提示，则使用export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/library来将本目录添加到so的搜索路径下，然后执行ldconfig命令来更新共享库的缓存即可
 
 #### 参与贡献
 
